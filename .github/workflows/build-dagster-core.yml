@@ -3,7 +3,7 @@ name: Build Dagster Images
 on:
   push:
     tags:
-      - release-dagster
+      - release
 
 env:
   REGISTRY: ghcr.io
