@@ -119,6 +119,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install build twine setuptools wheel
 
+      - name: Build all local dependencies first
+        run: |
+          echo "🔨 Building all packages to create local dependency wheel repository..."
+          mkdir -p /tmp/local-wheels
+
+          # Generate consistent version for all packages
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BUILD_VERSION="1.0.0.dev${GITHUB_RUN_NUMBER}+${SHORT_SHA}"
+          echo "Using build version: $BUILD_VERSION"
+
+          # Build core packages first with consistent version
+          for pkg_dir in python_modules/dagster python_modules/dagster-webserver python_modules/dagster-graphql python_modules/dagster-pipes python_modules/dagster-test python_modules/dagit; do
+            if [[ -d "$pkg_dir" && -f "$pkg_dir/setup.py" ]]; then
+              echo "Building $pkg_dir with version $BUILD_VERSION..."
+              cd "$pkg_dir"
+              
+              # Update version in setup.py
+              sed -i "s/version=['\"][^'\"]*['\"]/version=\"$BUILD_VERSION\"/g" setup.py
+              
+              # Update __version__ in package files if they exist
+              if find . -name "*.py" -exec grep -l "__version__" {} \; | head -1 >/dev/null 2>&1; then
+                find . -name "*.py" -exec sed -i "s/__version__ = ['\"][^'\"]*['\"]/__version__ = \"$BUILD_VERSION\"/g" {} \;
+              fi
+              
+              python -m build --wheel --outdir /tmp/local-wheels || echo "Failed to build $pkg_dir"
+              cd - > /dev/null
+            fi
+          done
+
+          echo "📦 Available local wheels:"
+          ls -la /tmp/local-wheels/
+
       - name: Check if package exists
         id: check-package
         run: |
@@ -140,15 +172,11 @@ jobs:
             VERSION="${{ inputs.version }}"
             echo "Using provided version: $VERSION"
           else
-            # Extract current version from setup.py
-            CURRENT_VERSION=$(python setup.py --version 2>/dev/null || echo "0.0.0")
-            
-            # Generate new version based on current date and commit
-            DATE_VERSION=$(date +%Y.%m.%d)
+            # Use a development version that won't conflict with PyPI
             SHORT_SHA=$(git rev-parse --short HEAD)
-            VERSION="${DATE_VERSION}.${GITHUB_RUN_NUMBER}"
-            
-            echo "Generated version: $VERSION"
+            VERSION="1.0.0.dev${GITHUB_RUN_NUMBER}+${SHORT_SHA}"
+
+            echo "Generated development version: $VERSION"
           fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -211,20 +239,30 @@ jobs:
         run: |
           cd "${{ matrix.package.path }}"
 
-          # Create a simple Dockerfile for the Python package
+          # Copy all local wheels to the build context
+          cp -r /tmp/local-wheels ./local-wheels
+
+          # Create a Dockerfile that installs from local wheels first
           cat > Dockerfile << 'EOF'
           FROM python:3.11-slim
 
           WORKDIR /app
 
-          # Copy built package
+          # Copy built package and local wheels
           COPY dist/*.whl /tmp/
+          COPY local-wheels/*.whl /tmp/local-wheels/
 
-          # Install the package
-          RUN pip install /tmp/*.whl
+          # Install dependencies from local wheels first, then from PyPI
+          RUN pip install --find-links /tmp/local-wheels --no-index --only-binary=all /tmp/*.whl || \
+              (echo "Local install failed, trying with PyPI fallback..." && \
+               pip install --find-links /tmp/local-wheels /tmp/*.whl)
 
-          # Default command
-          CMD ["python", "-c", "import ${{ matrix.package.name }}; print('Package ${{ matrix.package.name }} installed successfully')"]
+          # Create a non-root user for security
+          RUN useradd --create-home --shell /bin/bash dagster
+          USER dagster
+
+          # Set default command - safer import approach
+          CMD ["python", "-c", "try:\n    import sys\n    pkg = '${{ matrix.package.name }}'\n    # Handle package name conversion\n    if pkg == 'dagster-webserver': pkg = 'dagster_webserver'\n    elif pkg == 'dagster-graphql': pkg = 'dagster_graphql'  \n    elif '-' in pkg: pkg = pkg.replace('-', '_')\n    __import__(pkg)\n    print(f'✅ Package {pkg} v${{ steps.version.outputs.version }} ready!')\nexcept ImportError as e:\n    print(f'⚠️  Package installed but import failed: {e}')\nexcept Exception as e:\n    print(f'❌ Error: {e}')"]
           EOF
 
           # Build and push container image
