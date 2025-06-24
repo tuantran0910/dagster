@@ -66,7 +66,7 @@ The graph loaded into Dagster's web UI:
 
 Dagster is built to be used at every stage of the data development lifecycle - local development, unit tests, integration tests, staging environments, all the way up to production.
 
-## Quick Start:
+## Quick Start
 
 If you're new to Dagster, we recommend checking out the [docs](https://docs.dagster.io) or following the hands-on [tutorial](https://docs.dagster.io/etl-pipeline-tutorial/).
 
@@ -87,7 +87,7 @@ You can find the full Dagster documentation [here](https://docs.dagster.io), inc
 
 <hr/>
 
-## Key Features:
+## Key Features
 
   <p align="center">
     <img width="100%" alt="image" src="https://raw.githubusercontent.com/dagster-io/dagster/master/.github/key-features-cards.svg">
@@ -109,7 +109,7 @@ Maintain control over your data as the complexity scales. Centralize your metada
 
 ## Master the Modern Data Stack with integrations
 
-Dagster provides a growing library of integrations for today’s most popular data tools. Integrate with the tools you already use, and deploy to your infrastructure.
+Dagster provides a growing library of integrations for today's most popular data tools. Integrate with the tools you already use, and deploy to your infrastructure.
 
 <br/>
 <p align="center">
@@ -144,3 +144,90 @@ guide](https://docs.dagster.io/about/contributing).
 ## License
 
 Dagster is [Apache 2.0 licensed](https://github.com/dagster-io/dagster/blob/master/LICENSE).
+
+# Dagster Core with RBAC Authentication
+
+This repository contains a custom Dagster Core implementation with Role-Based Access Control (RBAC) authentication.
+
+## Features
+
+- **Role-Based Access Control (RBAC)** - 4 hierarchical roles (Admin, Editor, Launcher, Viewer)
+- **GitHub OAuth Integration** - Secure authentication with GitHub
+- **Granular Permissions** - Fine-grained control over operations
+- **Secure Sessions** - HTTP-only cookies with CSRF protection
+
+## Docker Image
+
+The Docker image is built and published to GitHub Container Registry with CalVer tags (YYYY.MM.DD.BUILD).
+
+### Using the Docker Image
+
+```bash
+docker pull ghcr.io/YOUR_USERNAME/dagster-core:latest
+```
+
+Replace `YOUR_USERNAME` with your GitHub username.
+
+## Releasing a New Version
+
+To release a new version of the Dagster Core image:
+
+1. Make your changes to the codebase
+2. Create and push a tag named `release-dagster-core`:
+
+```bash
+git tag release-dagster-core
+git push origin release-dagster-core
+```
+
+3. The GitHub Actions workflow will:
+   - Generate a CalVer tag (YYYY.MM.DD.BUILD)
+   - Build and push the Docker image to GitHub Container Registry
+   - Create a GitHub release
+   - Delete the trigger tag
+
+## Configuration
+
+### Authentication Configuration
+
+Add to your `dagster.yaml`:
+
+```yaml
+authentication:
+  enabled: true
+  provider: github
+  default_role: viewer
+  session_timeout: 86400  # 24 hours in seconds
+  
+  github:
+    client_id: "your-github-client-id"
+    client_secret: "your-github-client-secret"
+    redirect_uri: "http://localhost:3000/auth/callback"
+  
+  role_assignments:
+    # Assign roles by GitHub username or email
+    "admin-user": admin
+    "editor@company.com": editor
+    "launcher-user": launcher
+    # Users not listed get default_role
+```
+
+## Development
+
+### Local Build
+
+To build the Docker image locally:
+
+```bash
+docker build -t dagster-core:local .
+```
+
+### Running Locally
+
+```bash
+docker run -p 3000:3000 \
+  -v /path/to/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml \
+  -v /path/to/workspace.yaml:/opt/dagster/dagster_home/workspace.yaml \
+  dagster-core:local \
+  dagster-webserver -h 0.0.0.0 -p 3000
+```

@@ -1,0 +1,301 @@
+name: Build and Publish Python Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Comma-separated list of packages to build (e.g., dagster,dagster-webserver) or "all" for all packages'
+        required: true
+        default: "dagster"
+      version:
+        description: "Version to release (leave empty for auto-increment)"
+        required: false
+        default: ""
+      publish_to_ghcr:
+        description: "Publish to GitHub Container Registry"
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "release-*"
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  discover-packages:
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.discover.outputs.packages }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Discover packages to build
+        id: discover
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            INPUT_PACKAGES="${{ inputs.packages }}"
+          else
+            INPUT_PACKAGES="all"
+          fi
+
+          # Define core packages
+          CORE_PACKAGES=(
+            "python_modules/dagster"
+            "python_modules/dagster-webserver"
+            "python_modules/dagster-graphql"
+            "python_modules/dagster-pipes"
+            "python_modules/dagster-test"
+            "python_modules/dagit"
+          )
+
+          # Discover library packages
+          LIBRARY_PACKAGES=($(find python_modules/libraries -maxdepth 1 -type d -not -path "python_modules/libraries" | sort))
+
+          if [[ "$INPUT_PACKAGES" == "all" ]]; then
+            ALL_PACKAGES=("${CORE_PACKAGES[@]}" "${LIBRARY_PACKAGES[@]}")
+          else
+            # Parse comma-separated input
+            IFS=',' read -ra PACKAGE_NAMES <<< "$INPUT_PACKAGES"
+            ALL_PACKAGES=()
+            for pkg in "${PACKAGE_NAMES[@]}"; do
+              pkg=$(echo "$pkg" | xargs)  # trim whitespace
+              if [[ -d "python_modules/$pkg" ]]; then
+                ALL_PACKAGES+=("python_modules/$pkg")
+              elif [[ -d "python_modules/libraries/$pkg" ]]; then
+                ALL_PACKAGES+=("python_modules/libraries/$pkg")
+              else
+                echo "Warning: Package $pkg not found"
+              fi
+            done
+          fi
+
+          # Convert to JSON array
+          PACKAGES_JSON="["
+          for i in "${!ALL_PACKAGES[@]}"; do
+            if [[ $i -gt 0 ]]; then
+              PACKAGES_JSON+=","
+            fi
+            PACKAGE_PATH="${ALL_PACKAGES[$i]}"
+            PACKAGE_NAME=$(basename "$PACKAGE_PATH")
+            PACKAGES_JSON+="{\"name\":\"$PACKAGE_NAME\",\"path\":\"$PACKAGE_PATH\"}"
+          done
+          PACKAGES_JSON+="]"
+
+          echo "packages=$PACKAGES_JSON" >> $GITHUB_OUTPUT
+          echo "Discovered packages: $PACKAGES_JSON"
+
+  build-and-publish:
+    needs: discover-packages
+    runs-on: ubuntu-latest
+    if: needs.discover-packages.outputs.packages != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.discover-packages.outputs.packages) }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch full history for version calculation
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine setuptools wheel
+
+      - name: Check if package exists
+        id: check-package
+        run: |
+          if [[ ! -f "${{ matrix.package.path }}/setup.py" ]]; then
+            echo "❌ No setup.py found in ${{ matrix.package.path }}"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "✅ Found setup.py in ${{ matrix.package.path }}"
+          echo "exists=true" >> $GITHUB_OUTPUT
+
+      - name: Determine version
+        if: steps.check-package.outputs.exists == 'true'
+        id: version
+        run: |
+          cd "${{ matrix.package.path }}"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+            echo "Using provided version: $VERSION"
+          else
+            # Extract current version from setup.py
+            CURRENT_VERSION=$(python setup.py --version 2>/dev/null || echo "0.0.0")
+            
+            # Generate new version based on current date and commit
+            DATE_VERSION=$(date +%Y.%m.%d)
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            VERSION="${DATE_VERSION}.${GITHUB_RUN_NUMBER}"
+            
+            echo "Generated version: $VERSION"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "package_name=${{ matrix.package.name }}" >> $GITHUB_OUTPUT
+
+      - name: Update version in setup.py
+        if: steps.check-package.outputs.exists == 'true'
+        run: |
+          cd "${{ matrix.package.path }}"
+
+          # Update version in setup.py
+          sed -i "s/version=['\"][^'\"]*['\"]/version=\"${{ steps.version.outputs.version }}\"/g" setup.py
+
+          # Update __version__ in package files if they exist
+          if find . -name "*.py" -exec grep -l "__version__" {} \; | head -1; then
+            find . -name "*.py" -exec sed -i "s/__version__ = ['\"][^'\"]*['\"]/__version__ = \"${{ steps.version.outputs.version }}\"/g" {} \;
+          fi
+
+          echo "Updated version to ${{ steps.version.outputs.version }}"
+
+      - name: Build package
+        if: steps.check-package.outputs.exists == 'true'
+        run: |
+          cd "${{ matrix.package.path }}"
+          echo "Building package in $(pwd)"
+          python -m build
+
+          echo "Built files:"
+          ls -la dist/
+
+      - name: Generate package metadata
+        if: steps.check-package.outputs.exists == 'true'
+        id: metadata
+        run: |
+          cd "${{ matrix.package.path }}"
+
+          # Get package description
+          DESCRIPTION=$(python setup.py --description 2>/dev/null || echo "Dagster package: ${{ matrix.package.name }}")
+
+          # Generate labels
+          LABELS="org.opencontainers.image.title=${{ matrix.package.name }}"
+          LABELS="$LABELS,org.opencontainers.image.description=$DESCRIPTION"
+          LABELS="$LABELS,org.opencontainers.image.version=${{ steps.version.outputs.version }}"
+          LABELS="$LABELS,org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+          LABELS="$LABELS,org.opencontainers.image.revision=${{ github.sha }}"
+          LABELS="$LABELS,org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          echo "labels=$LABELS" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        if: steps.check-package.outputs.exists == 'true' && (inputs.publish_to_ghcr == true || github.event_name != 'workflow_dispatch')
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and publish Python package container
+        if: steps.check-package.outputs.exists == 'true' && (inputs.publish_to_ghcr == true || github.event_name != 'workflow_dispatch')
+        run: |
+          cd "${{ matrix.package.path }}"
+
+          # Create a simple Dockerfile for the Python package
+          cat > Dockerfile << 'EOF'
+          FROM python:3.11-slim
+
+          WORKDIR /app
+
+          # Copy built package
+          COPY dist/*.whl /tmp/
+
+          # Install the package
+          RUN pip install /tmp/*.whl
+
+          # Default command
+          CMD ["python", "-c", "import ${{ matrix.package.name }}; print('Package ${{ matrix.package.name }} installed successfully')"]
+          EOF
+
+          # Build and push container image
+          IMAGE_NAME="${{ env.REGISTRY }}/${{ github.repository_owner }}/dagster-${{ matrix.package.name }}"
+          docker build \
+            --label "${{ steps.metadata.outputs.labels }}" \
+            --tag "${IMAGE_NAME}:${{ steps.version.outputs.version }}" \
+            --tag "${IMAGE_NAME}:latest" \
+            .
+
+          docker push "${IMAGE_NAME}:${{ steps.version.outputs.version }}"
+          docker push "${IMAGE_NAME}:latest"
+
+          echo "📦 Published container: ${IMAGE_NAME}:${{ steps.version.outputs.version }}"
+
+      - name: Create GitHub Release
+        if: steps.check-package.outputs.exists == 'true' && github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ matrix.package.path }}/dist/*
+          tag_name: ${{ matrix.package.name }}-v${{ steps.version.outputs.version }}
+          name: ${{ matrix.package.name }} v${{ steps.version.outputs.version }}
+          body: |
+            ## ${{ matrix.package.name }} v${{ steps.version.outputs.version }}
+
+            Built from commit: ${{ github.sha }}
+
+            ### Installation
+
+            **From GitHub Container Registry:**
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ github.repository_owner }}/dagster-${{ matrix.package.name }}:${{ steps.version.outputs.version }}
+            ```
+
+            **From source:**
+            ```bash
+            pip install ${{ matrix.package.name }}==${{ steps.version.outputs.version }}
+            ```
+
+      - name: Upload build artifacts
+        if: steps.check-package.outputs.exists == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.package.name }}-${{ steps.version.outputs.version }}
+          path: ${{ matrix.package.path }}/dist/*
+          retention-days: 30
+
+  summary:
+    needs: [discover-packages, build-and-publish]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## 📦 Package Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Packages:** ${{ inputs.packages || 'all' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Python Version:** ${{ env.PYTHON_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.build-and-publish.result }}" == "success" ]]; then
+            echo "✅ **Status:** All packages built successfully" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ needs.build-and-publish.result }}" == "failure" ]]; then
+            echo "❌ **Status:** Some packages failed to build" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Status:** Build completed with warnings" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [📊 Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [📦 Package Registry](https://github.com/${{ github.repository_owner }}?tab=packages&repo_name=dagster)" >> $GITHUB_STEP_SUMMARY
+          echo "- [🏷️ Releases](${{ github.server_url }}/${{ github.repository }}/releases)" >> $GITHUB_STEP_SUMMARY

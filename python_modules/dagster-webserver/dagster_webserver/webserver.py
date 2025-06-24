@@ -2,6 +2,8 @@ import gzip
 import io
 import mimetypes
 import uuid
+import secrets
+import os
 from os import path, walk
 from typing import Generic, Optional, TypeVar
 
@@ -9,11 +11,16 @@ import dagster._check as check
 from dagster import __version__ as dagster_version
 from dagster._annotations import deprecated
 from dagster._core.debug import DebugRunPayload
-from dagster._core.storage.cloud_storage_compute_log_manager import CloudStorageComputeLogManager
+from dagster._core.storage.cloud_storage_compute_log_manager import (
+    CloudStorageComputeLogManager,
+)
 from dagster._core.storage.compute_log_manager import ComputeIOType
 from dagster._core.storage.local_compute_log_manager import LocalComputeLogManager
 from dagster._core.storage.runs.sql_run_storage import SqlRunStorage
-from dagster._core.workspace.context import BaseWorkspaceRequestContext, IWorkspaceProcessContext
+from dagster._core.workspace.context import (
+    BaseWorkspaceRequestContext,
+    IWorkspaceProcessContext,
+)
 from dagster._utils import Counter, traced_counter
 from dagster_graphql import __version__ as dagster_graphql_version
 from dagster_graphql.schema import create_schema
@@ -33,6 +40,7 @@ from starlette.responses import (
 )
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.types import Message
+from starlette.middleware.sessions import SessionMiddleware
 
 from dagster_webserver.external_assets import (
     handle_report_asset_check_request,
@@ -41,10 +49,14 @@ from dagster_webserver.external_assets import (
 )
 from dagster_webserver.graphql import GraphQLServer
 from dagster_webserver.version import __version__
+from dagster_webserver.auth import AuthManager, AuthenticatedWorkspaceRequestContext
+from dagster_webserver.auth.middleware import get_current_user
 
 mimetypes.init()
 
-T_IWorkspaceProcessContext = TypeVar("T_IWorkspaceProcessContext", bound=IWorkspaceProcessContext)
+T_IWorkspaceProcessContext = TypeVar(
+    "T_IWorkspaceProcessContext", bound=IWorkspaceProcessContext
+)
 
 
 class DagsterWebserver(
@@ -60,10 +72,12 @@ class DagsterWebserver(
         app_path_prefix: str = "",
         live_data_poll_rate: Optional[int] = None,
         uses_app_path_prefix: bool = True,
+        auth_manager: Optional[AuthManager] = None,
     ):
         self._process_context = process_context
         self._live_data_poll_rate = live_data_poll_rate
         self._uses_app_path_prefix = uses_app_path_prefix
+        self._auth_manager = auth_manager
         super().__init__(app_path_prefix)
 
     def build_graphql_schema(self) -> Schema:
@@ -76,10 +90,48 @@ class DagsterWebserver(
         return path.join(path.dirname(__file__), rel)
 
     def make_request_context(self, conn: HTTPConnection) -> BaseWorkspaceRequestContext:
-        return self._process_context.create_request_context(conn)
+        base_context = self._process_context.create_request_context(conn)
+
+        # If authentication is enabled, wrap with authenticated context
+        if self._auth_manager:
+            user = get_current_user(conn) if hasattr(conn, "state") else None
+            return AuthenticatedWorkspaceRequestContext(
+                instance=base_context.instance,
+                current_workspace=base_context.get_current_workspace(),
+                process_context=base_context.process_context,
+                version=base_context.version,
+                source=conn,
+                read_only=base_context.read_only,
+                user=user,
+            )
+
+        return base_context
+
+    def _get_session_secret_key(self) -> str:
+        """Get or generate a session secret key."""
+        secret_key = os.environ.get("DAGSTER_SESSION_SECRET")
+        if secret_key:
+            return secret_key
+
+        return secrets.token_hex(32)
 
     def build_middleware(self) -> list[Middleware]:
-        return [Middleware(DagsterTracedCounterMiddleware)]
+        middleware = [
+            Middleware(DagsterTracedCounterMiddleware),
+            Middleware(
+                SessionMiddleware, 
+                secret_key=self._get_session_secret_key()
+            ),
+        ]
+
+        if self._auth_manager:
+            auth_middleware = self._auth_manager.get_middleware()
+            # Set the app reference for the middleware
+            middleware.append(
+                Middleware(type(auth_middleware), **auth_middleware.__dict__)
+            )
+
+        return middleware
 
     def make_security_headers(self) -> dict:
         return {
@@ -155,7 +207,9 @@ class DagsterWebserver(
         notebook = nbformat.reads(notebook_content, as_version=4)
         html_exporter = HTMLExporter()
         (body, resources) = html_exporter.from_notebook_node(notebook)
-        return HTMLResponse("<style>" + resources["inlining"]["css"][0] + "</style>" + body)
+        return HTMLResponse(
+            "<style>" + resources["inlining"]["css"][0] + "</style>" + body
+        )
 
     async def download_captured_logs_endpoint(self, request: Request):
         [*log_key, file_extension] = request.path_params["path"].split("/")
@@ -170,7 +224,11 @@ class DagsterWebserver(
             )
 
         if isinstance(compute_log_manager, CloudStorageComputeLogManager):
-            io_type = ComputeIOType.STDOUT if file_extension == "out" else ComputeIOType.STDERR
+            io_type = (
+                ComputeIOType.STDOUT
+                if file_extension == "out"
+                else ComputeIOType.STDERR
+            )
             if compute_log_manager.cloud_storage_has_logs(
                 log_key, io_type
             ) and not compute_log_manager.has_local_file(log_key, io_type):
@@ -179,7 +237,9 @@ class DagsterWebserver(
                 log_key, file_extension
             )
         else:
-            location = compute_log_manager.get_captured_local_path(log_key, file_extension)
+            location = compute_log_manager.get_captured_local_path(
+                log_key, file_extension
+            )
 
         if not location or not path.exists(location):
             raise HTTPException(404, detail="No log files available for download")
@@ -187,7 +247,9 @@ class DagsterWebserver(
         filebase = "__".join(log_key)
         return FileResponse(location, filename=f"{filebase}.{file_extension}")
 
-    async def report_asset_materialization_endpoint(self, request: Request) -> JSONResponse:
+    async def report_asset_materialization_endpoint(
+        self, request: Request
+    ) -> JSONResponse:
         context = self.make_request_context(request)
         return await handle_report_asset_materialization_request(context, request)
 
@@ -224,7 +286,8 @@ class DagsterWebserver(
                     .replace("__PATH_PREFIX__", self._app_path_prefix)
                     .replace("__INSTANCE_ID__", run_storage_id or "")
                     .replace(
-                        '"__TELEMETRY_ENABLED__"', str(context.instance.telemetry_enabled).lower()
+                        '"__TELEMETRY_ENABLED__"',
+                        str(context.instance.telemetry_enabled).lower(),
                     )
                     .replace("NONCE-PLACEHOLDER", nonce)
                 )
@@ -285,22 +348,27 @@ class DagsterWebserver(
         emit_runtime_warning=False,
     )
     def build_routes(self):
+        base_routes = [
+            Route("/server_info", self.webserver_info_endpoint),
+            Route("/dagit_info", self.webserver_info_endpoint),
+            Route(
+                "/graphql",
+                self.graphql_http_endpoint,
+                name="graphql-http",
+                methods=["GET", "POST"],
+            ),
+            WebSocketRoute(
+                "/graphql",
+                self.graphql_ws_endpoint,
+                name="graphql-ws",
+            ),
+        ]
+
+        if self._auth_manager:
+            base_routes.extend(self._auth_manager.get_auth_routes())
+
         routes = (
-            [
-                Route("/server_info", self.webserver_info_endpoint),
-                Route("/dagit_info", self.webserver_info_endpoint),
-                Route(
-                    "/graphql",
-                    self.graphql_http_endpoint,
-                    name="graphql-http",
-                    methods=["GET", "POST"],
-                ),
-                WebSocketRoute(
-                    "/graphql",
-                    self.graphql_ws_endpoint,
-                    name="graphql-ws",
-                ),
-            ]
+            base_routes
             + self.build_static_routes()
             + [
                 # download file endpoints
@@ -371,7 +439,9 @@ class DagsterTracedCounterMiddleware:
                 counter = traced_counter.get()
                 if counter and isinstance(counter, Counter):
                     headers = MutableHeaders(scope=message)
-                    headers.append("x-dagster-call-counts", json.dumps(counter.counts()))
+                    headers.append(
+                        "x-dagster-call-counts", json.dumps(counter.counts())
+                    )
 
             return send(message)
 

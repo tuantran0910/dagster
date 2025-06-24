@@ -1,0 +1,73 @@
+run_storage:
+  module: dagster_postgres.run_storage
+  class: DagsterPostgresRunStorage
+  config:
+    postgres_db:
+      hostname: localhost
+      username: dagster
+      password: dagster
+      db_name: dagster
+
+event_log_storage:
+  module: dagster_postgres.event_log
+  class: DagsterPostgresEventLogStorage
+  config:
+    postgres_db:
+      hostname: localhost
+      username: dagster
+      password: dagster
+      db_name: dagster
+
+schedule_storage:
+  module: dagster_postgres.schedule_storage
+  class: DagsterPostgresScheduleStorage
+  config:
+    postgres_db:
+      hostname: localhost
+      username: dagster
+      password: dagster
+      db_name: dagster
+
+# Authentication configuration
+authentication:
+  enabled: true
+  provider: github
+  default_role: viewer
+  session_timeout: 86400
+  
+  github:
+    client_id: "${GITHUB_CLIENT_ID}"
+    client_secret: "${GITHUB_CLIENT_SECRET}"
+    redirect_uri: "http://localhost:3000/auth/callback"
+  
+  role_assignments:
+    "admin-username": admin
+    "admin@company.com": admin
+    "editor-username": editor
+    "editor@company.com": editor
+    "launcher-username": launcher
+  
+  public_paths:
+    - "/health"
+    - "/metrics"
+
+telemetry:
+  enabled: false
+
+python_logs:
+  python_log_level: INFO
+  dagster_handler_config:
+    handlers:
+      console:
+        class: logging.StreamHandler
+        level: INFO
+        formatter: colored
+    formatters:
+      colored:
+        class: dagster.logging.handler.ColoredFormatter
+
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 10

@@ -520,37 +520,106 @@ def get_concurrency_config() -> Field:
     )
 
 
+def authentication_config_schema() -> Mapping[str, Field]:
+    """Configuration schema for authentication settings."""
+    return {
+        "enabled": Field(BoolSource, is_required=False, default_value=False),
+        "provider": Field(StringSource, is_required=False, default_value="github"),
+        "default_role": Field(
+            StringSource, 
+            is_required=False, 
+            default_value="viewer",
+            description="Default role assigned to new users"
+        ),
+        "session_timeout": Field(
+            IntSource, 
+            is_required=False, 
+            default_value=86400,  # 24 hours
+            description="Session timeout in seconds"
+        ),
+        "github": Field(
+            {
+                "client_id": Field(StringSource, is_required=True),
+                "client_secret": Field(StringSource, is_required=True),
+                "redirect_uri": Field(StringSource, is_required=True),
+            },
+            is_required=False,
+        ),
+        "role_assignments": Field(
+            dict,
+            is_required=False,
+            default_value={},
+            description="Map of usernames/emails to roles"
+        ),
+        "public_paths": Field(
+            Array(String),
+            is_required=False,
+            default_value=[],
+            description="Additional paths that don't require authentication"
+        ),
+    }
+
+
 def dagster_instance_config_schema() -> Mapping[str, Field]:
     return {
-        "local_artifact_storage": config_field_for_configurable_class(),
-        "compute_logs": config_field_for_configurable_class(),
-        "storage": storage_config_schema(),
-        "run_queue": run_queue_config_schema(),
-        "run_storage": config_field_for_configurable_class(),
-        "event_log_storage": config_field_for_configurable_class(),
-        "schedule_storage": config_field_for_configurable_class(),
-        "scheduler": config_field_for_configurable_class(),
-        "run_coordinator": config_field_for_configurable_class(),
-        "run_launcher": config_field_for_configurable_class(),
+        "local_artifact_storage": Field(configurable_class_schema(), is_required=False),
+        "run_storage": Field(configurable_class_schema(), is_required=False),
+        "event_log_storage": Field(configurable_class_schema(), is_required=False),
+        "schedule_storage": Field(configurable_class_schema(), is_required=False),
+        "scheduler": Field(configurable_class_schema(), is_required=False),
+        "run_coordinator": Field(configurable_class_schema(), is_required=False),
+        "run_launcher": Field(configurable_class_schema(), is_required=False),
+        "run_queue": Field(
+            Shape(
+                {
+                    "max_concurrent_runs": Field(IntSource, is_required=False),
+                    "tag_concurrency_limits": Field(
+                        Array(
+                            Shape(
+                                {
+                                    "key": Field(String),
+                                    "value": Field(String, is_required=False),
+                                    "limit": Field(IntSource),
+                                }
+                            )
+                        ),
+                        is_required=False,
+                    ),
+                }
+            ),
+            is_required=False,
+        ),
+        "storage": Field(
+            Selector(
+                {
+                    "postgres": Field(pg_config()),
+                    "mysql": Field(mysql_config()),
+                    "sqlite": Field({"base_dir": StringSource}),
+                    "custom": Field(configurable_class_schema()),
+                }
+            ),
+            is_required=False,
+        ),
         "telemetry": Field(
-            {"enabled": Field(Bool, is_required=False)},
+            Shape({"enabled": Field(Bool, is_required=False)}),
+            is_required=False,
         ),
         "nux": Field(
-            {"enabled": Field(Bool, is_required=False)},
+            Shape({"enabled": Field(Bool, is_required=False)}),
+            is_required=False,
         ),
-        "instance_class": config_field_for_configurable_class(),
         "python_logs": python_logs_config_schema(),
+        "compute_logs": Field(configurable_class_schema(), is_required=False),
         "run_monitoring": Field(
             {
-                "enabled": Field(Bool, is_required=False),
-                "start_timeout_seconds": Field(int, is_required=False),
-                "cancel_timeout_seconds": Field(int, is_required=False),
-                "max_runtime_seconds": Field(int, is_required=False),
-                "max_resume_run_attempts": Field(int, is_required=False),
-                "poll_interval_seconds": Field(int, is_required=False),
-                "cancellation_thread_poll_interval_seconds": Field(int, is_required=False),
-                "free_slots_after_run_end_seconds": Field(int, is_required=False),
-            },
+                "enabled": Field(BoolSource, is_required=False, default_value=False),
+                "start_timeout_seconds": Field(IntSource, is_required=False),
+                "cancel_timeout_seconds": Field(IntSource, is_required=False),
+                "max_runtime_seconds": Field(IntSource, is_required=False),
+                "max_resume_run_attempts": Field(IntSource, is_required=False),
+                "poll_interval_seconds": Field(IntSource, is_required=False),
+                "cancellation_thread_poll_interval_seconds": Field(IntSource, is_required=False),
+            }
         ),
         "run_retries": Field(
             {
@@ -608,6 +677,11 @@ def dagster_instance_config_schema() -> Mapping[str, Field]:
             }
         ),
         "concurrency": get_concurrency_config(),
+        "authentication": Field(
+            authentication_config_schema(),
+            is_required=False,
+            description="Authentication and authorization settings"
+        ),
     }
 
 
